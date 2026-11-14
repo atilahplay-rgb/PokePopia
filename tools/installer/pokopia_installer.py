@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 import zipfile
 from contextlib import contextmanager
@@ -35,6 +37,16 @@ ROMFS_FILES = (
     "motor_asset_re/KIDS_PLATFORM_OUNCE/root.rdb",
     "motor_asset_re/KIDS_PLATFORM_OUNCE/0x4b13d561.fdata",
 )
+
+# Approximate sizes of the translated files (version 2.0.1). They are only used
+# to estimate the total work before the real package is opened.
+ROMFS_APPROX_SIZES = {
+    "LD_C0_R.BIN": 264_226_048,
+    "LI_C0_R.IDX": 393_536,
+    "motor_asset_re/KIDS_PLATFORM_OUNCE/root.rdb": 5_752_340,
+    "motor_asset_re/KIDS_PLATFORM_OUNCE/0x4b13d561.fdata": 25_043_116,
+}
+DOWNLOAD_APPROX_BYTES = 175 * 1024 * 1024
 
 # The index and asset sizes distinguish the two supported game updates.
 VERSIONS = {
@@ -429,6 +441,75 @@ def open_package(package: Path | FolderPackage):
             yield archive
 
 
+def format_duration(seconds: float) -> str:
+    """Format a duration as mm:ss (or h:mm:ss from one hour on)."""
+    seconds = max(int(round(seconds)), 0)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+class ProgressTracker:
+    """Counts the bytes of work of an installation and reports it to the UI.
+
+    It lives in the worker thread and only talks to the interface through the
+    event queue ("work", done, total, timestamp), throttled to ~10 per second.
+    """
+
+    EMIT_INTERVAL = 0.1
+
+    def __init__(self, events: queue.Queue) -> None:
+        self.events = events
+        self.reset()
+
+    def reset(self) -> None:
+        self.done = 0
+        self.download_total = 0
+        self.plan_total = 0
+        self.target_planned = 0
+        self.target_done = 0
+        self._last_emit = 0.0
+
+    @property
+    def total(self) -> int:
+        return max(self.download_total + self.plan_total, self.done)
+
+    def emit(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - self._last_emit >= self.EMIT_INTERVAL:
+            self._last_emit = now
+            self.events.put(("work", self.done, max(self.total, 1), now))
+
+    def set_download_total(self, size: int) -> None:
+        self.download_total = max(size, 0)
+        self.emit(force=True)
+
+    def set_plan(self, planned: list[int]) -> None:
+        self.plan_total = sum(planned)
+        self.emit(force=True)
+
+    def begin_target(self, planned: int) -> None:
+        self.target_planned = planned
+        self.target_done = 0
+
+    def advance(self, amount: int, in_target: bool = True) -> None:
+        self.done += amount
+        if in_target:
+            self.target_done += amount
+        self.emit()
+
+    def end_target(self) -> None:
+        """Settle the target: shortcuts (already installed) skip planned work."""
+        if self.target_done < self.target_planned:
+            self.done += self.target_planned - self.target_done
+        elif self.target_done > self.target_planned:
+            self.plan_total += self.target_done - self.target_planned
+        self.target_planned = self.target_done = 0
+        self.emit(force=True)
+
+
 class Installer:
     def __init__(self) -> None:
         self.root = tk.Tk()
@@ -438,7 +519,14 @@ class Installer:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.events: queue.Queue = queue.Queue()
+        self.tracker = ProgressTracker(self.events)
         self.busy = False
+        self.work_start = 0.0
+        self.work_done = 0
+        self.work_total = 0
+        self.work_samples: collections.deque = collections.deque()
+        self.speed_ema: float | None = None
+        self.timer_job = None
         self.candidates: list[dict] = []
         self.checkboxes: list[tuple[dict, tk.BooleanVar]] = []
 
@@ -502,7 +590,9 @@ class Installer:
         self.empty_label.pack(anchor="w")
 
         self.progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
-        self.progress.pack(fill="x", pady=(0, 12))
+        self.progress.pack(fill="x", pady=(0, 4))
+        self.time_label = ttk.Label(frame, text=" ", anchor="w")
+        self.time_label.pack(fill="x", pady=(0, 12))
 
         footer = ttk.Frame(frame)
         footer.pack(fill="x")
@@ -779,6 +869,7 @@ class Installer:
         self.install_button.configure(state="disabled")
         self.progress.configure(value=0)
         self.status_label.configure(text="Preparando o pacote de tradução…")
+        self.start_timer()
         threading.Thread(
             target=self.install_worker, args=(selected,), daemon=True
         ).start()
@@ -786,9 +877,15 @@ class Installer:
     def install_worker(self, targets: list[dict]) -> None:
         outcomes: list[dict] = []
         try:
+            self.tracker.reset()
+            planned = [self._plan_for(t, None) for t in targets]
+            self.tracker.set_plan(planned)
             package = self.ensure_package()
             with open_package(package) as archive:
-                for target in targets:
+                planned = [self._plan_for(t, archive) for t in targets]
+                self.tracker.set_plan(planned)
+                for target, plan in zip(targets, planned):
+                    self.tracker.begin_target(plan)
                     try:
                         output = None
                         if target.get("mode") == "nup":
@@ -823,9 +920,57 @@ class Installer:
                                 "error": str(exc),
                             }
                         )
+                    self.tracker.end_target()
             self.events.put(("complete", outcomes))
         except Exception as exc:
             self.events.put(("fatal_error", str(exc)))
+
+    def _plan_for(self, target: dict, archive) -> int:
+        """Estimate the bytes of work for one target (extract, copy, backup)."""
+        sizes = {}
+        for relative in ROMFS_FILES:
+            sizes[relative] = ROMFS_APPROX_SIZES[relative]
+            if archive is not None:
+                try:
+                    member = f"{target['version']}/romfs/{relative}"
+                    sizes[relative] = archive.getinfo(member).file_size
+                except KeyError:
+                    pass
+        extract = sum(sizes.values())
+        mode = target.get("mode")
+        if mode == "nup":
+            try:
+                return extract + Path(target["path"]).stat().st_size
+            except OSError:
+                return extract
+        romfs = Path(target["romfs_path"] if mode == "nsp_mod" else target["path"])
+        existing = 0
+        for relative in ROMFS_FILES:
+            try:
+                existing += (romfs / Path(relative)).stat().st_size
+            except OSError:
+                pass
+        # nsp_mod also hashes the current files before backing them up.
+        return extract + existing * (2 if mode == "nsp_mod" else 1)
+
+    def _pump(self, source, output, digest=None, chunk: int = 1024 * 1024) -> int:
+        """Copy a stream while reporting progress; returns the bytes copied."""
+        total = 0
+        while True:
+            block = source.read(chunk)
+            if not block:
+                return total
+            output.write(block)
+            if digest is not None:
+                digest.update(block)
+            total += len(block)
+            self.tracker.advance(len(block))
+
+    def _copy_file(self, source: Path, destination: Path) -> None:
+        """Like shutil.copy2, but reporting progress."""
+        with source.open("rb") as reader, destination.open("wb") as writer:
+            self._pump(reader, writer)
+        shutil.copystat(source, destination)
 
     def ensure_package(self) -> Path | FolderPackage:
         bundled_root = app_directory()
@@ -858,6 +1003,7 @@ class Installer:
             with urllib.request.urlopen(request, timeout=60) as response:
                 total = int(response.headers.get("Content-Length", "0") or "0")
                 downloaded = 0
+                self.tracker.set_download_total(total or DOWNLOAD_APPROX_BYTES)
                 with partial.open("wb") as output:
                     while True:
                         block = response.read(1024 * 1024)
@@ -865,6 +1011,7 @@ class Installer:
                             break
                         output.write(block)
                         downloaded += len(block)
+                        self.tracker.advance(len(block), in_target=False)
                         percent = int(downloaded * 100 / total) if total else 0
                         self.events.put(
                             ("progress", percent, downloaded, total)
@@ -917,15 +1064,9 @@ class Installer:
                 staged = stage / Path(relative)
                 staged.parent.mkdir(parents=True, exist_ok=True)
                 digest = hashlib.sha256()
-                total = 0
+                self.events.put(("status", f"Extraindo {Path(relative).name}…"))
                 with archive.open(member, "r") as source, staged.open("wb") as output:
-                    while True:
-                        block = source.read(1024 * 1024)
-                        if not block:
-                            break
-                        output.write(block)
-                        digest.update(block)
-                        total += len(block)
+                    total = self._pump(source, output, digest)
                 if total != info.file_size:
                     raise IOError(f"Extração incompleta do arquivo {member}.")
                 staged_files[relative] = {
@@ -1003,6 +1144,7 @@ class Installer:
                         raise IOError("Leitura incompleta do NUP original.")
                     output.write(block)
                     remaining -= len(block)
+                    self.tracker.advance(len(block))
 
             with source_path.open("rb") as source, temp_output.open("wb") as output:
                 self.events.put((
@@ -1023,12 +1165,13 @@ class Installer:
                     if extent_offset > written:
                         output.write(b"\0" * (extent_offset - written))
                     with staged_files[relative]["path"].open("rb") as staged:
-                        shutil.copyfileobj(staged, output, 1024 * 1024)
+                        self._pump(staged, output)
                     written = extent_offset + staged_files[relative]["size"]
                 copy_range(source, output, metadata_start, source_size - metadata_start)
                 output.flush()
                 os.fsync(output.fileno())
 
+            self.events.put(("status", "Verificando a cópia NUP gerada…"))
             verified = read_nup_layout(temp_output)
             verified_target = inspect_nup(temp_output, verified)
             for relative, entry in staged_files.items():
@@ -1087,19 +1230,14 @@ class Installer:
                 staged = stage / Path(relative)
                 staged.parent.mkdir(parents=True, exist_ok=True)
                 digest = hashlib.sha256()
-                total = 0
+                self.events.put(("status", f"Extraindo {Path(relative).name}…"))
                 with archive.open(member, "r") as source, staged.open("wb") as output:
-                    while True:
-                        block = source.read(1024 * 1024)
-                        if not block:
-                            break
-                        output.write(block)
-                        digest.update(block)
-                        total += len(block)
+                    total = self._pump(source, output, digest)
                 if total != info.file_size:
                     raise IOError(f"Extração incompleta do arquivo {member}.")
                 staged_files[relative] = {"path": staged, "sha256": digest.digest()}
 
+            self.events.put(("status", "Comparando com os arquivos atuais…"))
             if all(
                 (romfs / Path(relative)).is_file()
                 and self._file_sha256(romfs / Path(relative)) == entry["sha256"]
@@ -1107,6 +1245,7 @@ class Installer:
             ):
                 return None
 
+            self.events.put(("status", "Criando backup dos arquivos atuais…"))
             backup.mkdir(parents=True, exist_ok=False)
             backed_up = []
             for relative in ROMFS_FILES:
@@ -1115,7 +1254,7 @@ class Installer:
                     continue
                 destination = backup / Path(relative)
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(current, destination)
+                self._copy_file(current, destination)
                 backed_up.append(relative)
 
             manifest = {
@@ -1151,8 +1290,7 @@ class Installer:
         finally:
             shutil.rmtree(stage, ignore_errors=True)
 
-    @staticmethod
-    def _file_sha256(path: Path) -> bytes:
+    def _file_sha256(self, path: Path) -> bytes:
         digest = hashlib.sha256()
         with path.open("rb") as source:
             while True:
@@ -1160,6 +1298,7 @@ class Installer:
                 if not block:
                     return digest.digest()
                 digest.update(block)
+                self.tracker.advance(len(block))
 
     def apply_patch(self, archive: zipfile.ZipFile, target: dict) -> Path | None:
         version = target["version"]
@@ -1193,6 +1332,7 @@ class Installer:
         )
         backup.mkdir(parents=True, exist_ok=False)
 
+        self.events.put(("status", "Criando backup dos arquivos atuais…"))
         # Preserve the current game files before changing any of them.
         for relative in ROMFS_FILES:
             source = romfs / Path(relative)
@@ -1200,7 +1340,7 @@ class Installer:
                 raise FileNotFoundError(f"Arquivo ausente na pasta do jogo: {source}")
             destination = backup / Path(relative)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
+            self._copy_file(source, destination)
 
         manifest = {
             "installer_version": APP_VERSION,
@@ -1220,8 +1360,9 @@ class Installer:
             for relative, member in member_names.items():
                 staged = stage / Path(relative)
                 staged.parent.mkdir(parents=True, exist_ok=True)
+                self.events.put(("status", f"Extraindo {Path(relative).name}…"))
                 with archive.open(member, "r") as source, staged.open("wb") as output:
-                    shutil.copyfileobj(source, output, 1024 * 1024)
+                    self._pump(source, output)
                 if staged.stat().st_size != archive.getinfo(member).file_size:
                     raise IOError(f"Extração incompleta do arquivo {member}.")
 
@@ -1256,9 +1397,10 @@ class Installer:
                     )
                 elif kind == "status":
                     self.status_label.configure(text=event[1])
+                elif kind == "work":
+                    self.on_work(event)
                 elif kind == "progress":
-                    _kind, percent, downloaded, total = event
-                    self.progress.configure(value=percent)
+                    _kind, _percent, downloaded, total = event
                     if total:
                         self.status_label.configure(
                             text=(
@@ -1274,6 +1416,70 @@ class Installer:
         except queue.Empty:
             pass
         self.root.after(150, self.poll_events)
+
+    def start_timer(self) -> None:
+        self.work_start = time.monotonic()
+        self.work_done = 0
+        self.work_total = 0
+        self.work_samples.clear()
+        self.speed_ema = None
+        self.update_time_label()
+
+    def stop_timer(self, prefix: str) -> None:
+        if self.timer_job is not None:
+            self.root.after_cancel(self.timer_job)
+            self.timer_job = None
+        elapsed = time.monotonic() - self.work_start
+        self.time_label.configure(text=f"{prefix} {format_duration(elapsed)}")
+
+    def on_work(self, event: tuple) -> None:
+        _kind, done, total, stamp = event
+        self.work_done = done
+        self.work_total = total
+        self.work_samples.append((stamp, done))
+        self.progress.configure(value=min(done * 100 / total, 100))
+
+    def estimate_remaining(self, now: float) -> float | None:
+        """Seconds left, from the speed of the last ~15 s (None = still unknown)."""
+        samples = self.work_samples
+        cutoff = now - 15.0
+        while len(samples) > 2 and samples[0][0] < cutoff:
+            samples.popleft()
+        if len(samples) < 2 or self.work_total <= 0:
+            return None
+        first_time, first_done = samples[0]
+        last_done = samples[-1][1]
+        span = now - first_time
+        if span < 3.0 or last_done <= first_done:
+            return None
+        speed = (last_done - first_done) / span
+        if self.speed_ema is None:
+            self.speed_ema = speed
+        else:
+            self.speed_ema = 0.8 * self.speed_ema + 0.2 * speed
+        return max(self.work_total - self.work_done, 0) / self.speed_ema
+
+    def update_time_label(self) -> None:
+        if not self.busy:
+            return
+        now = time.monotonic()
+        elapsed = now - self.work_start
+        total = self.work_total
+        percent = min(self.work_done * 100 / total, 100) if total else 0
+        remaining = self.estimate_remaining(now)
+        if total and self.work_done >= total:
+            rest = "finalizando…"
+        elif remaining is None:
+            rest = "calculando…"
+        else:
+            rest = "~" + format_duration(max(remaining, 1))
+        self.time_label.configure(
+            text=(
+                f"{percent:.0f}%   •   Decorrido: {format_duration(elapsed)}"
+                f"   •   Restante: {rest}"
+            )
+        )
+        self.timer_job = self.root.after(500, self.update_time_label)
 
     def finish_install(self, outcomes: list[dict]) -> None:
         self.busy = False
@@ -1312,6 +1518,7 @@ class Installer:
                 )
 
         if errors:
+            self.stop_timer("Terminou com erro após")
             self.status_label.configure(text="A instalação terminou com erro em uma ou mais pastas.")
             messagebox.showerror(
                 "Instalação incompleta",
@@ -1319,6 +1526,7 @@ class Installer:
                 parent=self.root,
             )
         else:
+            self.stop_timer("Concluído em")
             self.status_label.configure(text="Tradução aplicada com sucesso.")
             messagebox.showinfo(
                 "Concluído",
@@ -1332,6 +1540,7 @@ class Installer:
         self.choose_package_button.configure(state="normal")
         self.update_install_button()
         self.progress.configure(value=0)
+        self.stop_timer("Interrompido após")
         self.status_label.configure(text="Não foi possível concluir a instalação.")
         messagebox.showerror(
             "Erro ao instalar",
